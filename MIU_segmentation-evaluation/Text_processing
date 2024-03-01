@@ -1,0 +1,253 @@
+import krippendorff
+from cassis import *
+import os 
+import re
+import pandas as pd
+import nltk
+nltk.download('punkt')
+from nltk.tokenize import word_tokenize, sent_tokenize
+import math
+import string
+
+## data import from local sources
+# import of full annotated calls
+with open('typesystem.xml', 'rb') as f:
+    typesystem = load_typesystem(f)
+path_to_files = './XMI_annotations'
+folder_contents = os.listdir(path_to_files)
+
+casses = []
+sofas = []
+
+for x in folder_contents:
+    xmi_file = path_to_files+'/'+x
+    with open(xmi_file, 'rb') as f:
+        cas = load_cas_from_xmi(f, typesystem=typesystem)
+        sofa = cas.sofa_string
+        casses.append(cas)
+        sofas.append(sofa)
+
+def remove_speaker_header(turn):
+    return re.sub('^\D+\(\w+;\D+\)', '', turn)
+
+turns_in_documents = []
+turns_in_documents_strings = []
+for cas in casses:
+    turns = cas.select('webanno.custom.SpeakerTurn')
+    turns_in_document = []
+    turns_in_document_string = ''
+    for turn in turns:
+        if turn.Speaker == 'analyst':
+            turns_in_document.append(remove_speaker_header(turn.get_covered_text()).replace('�', ' ').strip())
+            turns_in_document_string += remove_speaker_header(turn.get_covered_text()).replace('�', ' ').strip() + ' '
+    turns_in_documents.append(turns_in_document)
+    turns_in_documents_strings.append(turns_in_document_string.strip())
+
+# import of gold and gpt segmentations
+gold_standard = pd.read_excel('gold-standard.xlsx', index_col=0)
+gpt = pd.read_excel('gpt_segmentation.xlsx', index_col=0)
+
+gold_standard = gold_standard.applymap(lambda x: x.replace('�', ' '), na_action='ignore')
+gpt = gpt.applymap(lambda x: x.replace('�', ' '), na_action='ignore')
+
+# general functions
+def match_document(cell, documents):
+    for index, document in enumerate(documents):
+        if cell in document:
+            return index
+
+def compute_boundaries(segment, text, search_start):
+    #print(segment, '\n\n\n', text)
+    length = len(segment)
+    begin = text.find(segment, search_start)
+    #if match:
+    if begin != -1:
+        end = begin+length
+        return(begin, end)
+    else:
+        return(math.nan, math.nan)
+
+# evaluation - boundaries only
+def exclude_outer(df, begin, end):
+    for ind, row in df.iterrows():
+        if ind == 0 and end <= row.Begin:
+            return True
+        if begin < row.Begin and end <= row.Begin and begin >= df.iloc[ind-1].End and end > df.iloc[ind-1].End:
+            return True
+    return False
+
+cheat_clean = True
+for doc_index, doc in gold_standard.iterrows():
+    evaluation_df = pd.DataFrame()
+    csv_name = 'gold-GPT_clean_annotation_evaluation-'+str(doc_index)+'.csv'
+    document_index = match_document(gold_standard.iloc[doc_index][0][0:300], turns_in_documents_strings)
+    if isinstance(document_index, int):
+        search_start = 0
+        for MIU in doc:
+            if isinstance(MIU, str):
+                begin, end = compute_boundaries(MIU, turns_in_documents_strings[document_index], search_start)
+                if not math.isnan(begin):
+                    new_row = pd.DataFrame({'Annotator':'Gold', 'Category':'no-key', 'Begin':begin, 'End':end}, index=[0])
+                    evaluation_df = pd.concat([evaluation_df, new_row], ignore_index=True)
+                    search_start = end+1
+        search_start = 0
+        for MIU in gpt.iloc[doc_index]:
+            if isinstance(MIU, str):
+                begin, end = compute_boundaries(MIU, turns_in_documents_strings[document_index], search_start)
+                if not math.isnan(begin):
+                    search_start = end+1
+                    if cheat_clean == True:
+                        if exclude_outer(evaluation_df, begin, end) == True:
+                            #print('Outer segment detected ', begin, end)
+                            pass
+                        else:
+                            new_row = pd.DataFrame({'Annotator':'GPT', 'Category':'no-key', 'Begin':begin, 'End':end}, index=[0])
+                            evaluation_df = pd.concat([evaluation_df, new_row], ignore_index=True)
+                    elif cheat_clean == False:
+                        new_row = pd.DataFrame({'Annotator':'GPT', 'Category':'no-key', 'Begin':begin, 'End':end}, index=[0])
+                        evaluation_df = pd.concat([evaluation_df, new_row], ignore_index=True)
+    evaluation_df.to_csv(csv_name, index=False, header=False)
+
+## evaluation - IOB tags
+turns_in_documents_strings_unpunctuated = [doc.translate(str.maketrans('', '', string.punctuation)) for doc in turns_in_documents_strings]
+gold_standard_unpunctuated = gold_standard.applymap(lambda x: x.translate(str.maketrans('', '', string.punctuation)), na_action='ignore')
+gpt_unpunctuated = gpt.applymap(lambda x: x.translate(str.maketrans('', '', string.punctuation)), na_action='ignore')
+
+def matchingKeys(dict_list, last_MIU, first_element, searchString):
+    for dict_index, dictionary in enumerate(dict_list[last_MIU:]):
+        for key, values in dictionary.items():
+            if searchString in values:
+                if key== 'I' and first_element == True:
+                    return None, last_MIU, first_element
+                else:
+                    if key == 'B':
+                        first_element = False
+                    return key, last_MIU+dict_index, first_element
+        first_element = True
+    return None, last_MIU, first_element
+
+def exclude_O_tags(new_row, df, warning_flag):
+    if warning_flag == True:
+        if new_row.iloc[0].Category == 'I':
+            new_row.at[0,'Category'] = 'B'
+        warning_flag = False
+    for ind, row in df.iterrows():
+        if row.Category == 'O':
+            if new_row.iloc[0].Begin >= row.Begin and new_row.iloc[0].End <= row.End:
+                #print('New row indices: ', new_row.iloc[0].Begin, new_row.iloc[0].End, '\nCurrent df indices: ', row.Begin, row.End)
+                df = df.drop([ind])
+                if new_row.iloc[0].Category == 'B':
+                    warning_flag = True
+                return df, new_row, False, warning_flag
+    return df, new_row, True, warning_flag
+
+#IOB for gold standard
+IOB_tags = [] 
+evaluation_df = pd.DataFrame()
+for doc_index, doc in gold_standard.iterrows(): #for each document (within range)
+    document_IOB_list = []
+    # tokenizing each MIU and assigning IOB tags to each token
+    for MIU in doc:
+        if isinstance(MIU, str):
+            IOB_from_MIUs_dict = {'B':[], 'I':[]}
+            MIU_tokenization = sent_tokenize(MIU)
+            MIU_tokenization_unpunctuated = [sent.translate(str.maketrans('', '', string.punctuation)) for sent in MIU_tokenization]
+            # for each *unpunctuated* MIU, assigning to each of its tokens a I/B tag and storing the information in a dictionary
+            for token_index, token in enumerate(MIU_tokenization_unpunctuated):
+                if isinstance(token, str): # this is probably superfluous, but never say never
+                    if token_index == 0:
+                        IOB_from_MIUs_dict[0].append(token)
+                    else:
+                        IOB_from_MIUs_dict[1].append(token)
+        document_IOB_list.append(IOB_from_MIUs_dict)
+    
+    # matching the current document split into MIUs to its full text
+    document_index = match_document(gold_standard_unpunctuated.iloc[doc_index][0][0:300], turns_in_documents_strings_unpunctuated)
+    # tokenizing the full text
+    if isinstance(document_index, int):
+        #print('Document: ', document_index)
+        document_tokenization = sent_tokenize(turns_in_documents_strings[document_index])
+        document_tokenization_unpunctuated = [sent.translate(str.maketrans('', '', string.punctuation)) for sent in document_tokenization]
+    
+        # matching each token of the current document with tokens in MIUs;
+        # if the match is found, the final IOB tag will be the one stored in the dictionary previously created;
+        # if not, the assigned IOB tag is "O"
+        current_document_tags = []
+        search_start = 0
+        last_MIU = 0
+        first_element = True
+        for token in document_tokenization_unpunctuated:
+            key, last_MIU, first_element = matchingKeys(document_IOB_list, last_MIU, first_element, token)
+            begin, end = compute_boundaries(token, turns_in_documents_strings_unpunctuated[document_index], search_start)
+            if key:
+                current_document_tags.append(key)
+                #print(key, ': ', token)
+            else:
+                key = 'O'
+                current_document_tags.append(key)
+                #print(key, ': ', token)
+
+            if not math.isnan(begin):
+                new_row = pd.DataFrame({'Annotator':'Gold', 'Category':key, 'Document': doc_index, 'Begin':begin, 'End':end}, index=[0])
+                evaluation_df = pd.concat([evaluation_df, new_row], ignore_index=True)
+                search_start = end+1
+            
+    IOB_tags.append(current_document_tags)
+
+GPT_IOB_tags = [] 
+for doc_index, doc in gpt.iterrows(): #for each document (within range)
+    document_IOB_list = []
+    # tokenizing each MIU and assigning IOB tags to each token
+    for MIU in doc:
+        if isinstance(MIU, str):
+            warning_flag = False
+            IOB_from_MIUs_dict = {'B':[], 'I':[]}
+            MIU_tokenization = sent_tokenize(MIU)
+            MIU_tokenization_unpunctuated = [sent.translate(str.maketrans('', '', string.punctuation)) for sent in MIU_tokenization]
+            # for each *unpunctuated* MIU, assigning to each of its tokens a I/B tag and storing the information in a dictionary
+            for token_index, token in enumerate(MIU_tokenization_unpunctuated):
+                if isinstance(token, str): # this is probably superfluous, but never say never
+                    if token_index == 0:
+                        IOB_from_MIUs_dict['B'].append(token)
+                    else:
+                        IOB_from_MIUs_dict['I'].append(token)
+        document_IOB_list.append(IOB_from_MIUs_dict)
+    
+    # matching the current document split into MIUs to its full text
+    document_index = match_document(gold_standard_unpunctuated.iloc[doc_index][0][0:300], turns_in_documents_strings_unpunctuated)
+    # tokenizing the full text
+    if isinstance(document_index, int):
+        #print('Document: ', document_index)
+        document_tokenization = sent_tokenize(turns_in_documents_strings[document_index])
+        document_tokenization_unpunctuated = [sent.translate(str.maketrans('', '', string.punctuation)) for sent in document_tokenization]
+    
+        # matching each token of the current document with tokens in MIUs;
+        # if the match is found, the final IOB tag will be the one stored in the dictionary previously created;
+        # if not, the assigned IOB tag is "O"
+        current_document_tags = []
+        search_start = 0
+        last_MIU = 0
+        first_element = True
+        for token in document_tokenization_unpunctuated:
+            key, last_MIU, first_element = matchingKeys(document_IOB_list, last_MIU, first_element, token)
+            begin, end = compute_boundaries(token, turns_in_documents_strings_unpunctuated[document_index], search_start)
+            if key:
+                current_document_tags.append(key)
+                #print(key, ': ', token)
+            else:
+                key = 'O'
+                current_document_tags.append(key)
+                #print(key, ': ', token)
+
+            if not math.isnan(begin):
+                new_row = pd.DataFrame({'Annotator':'GPT', 'Category':key, 'Document': doc_index, 'Begin':begin, 'End':end}, index=[0])
+                evaluation_df, new_row, acceptable, warning_flag = exclude_O_tags(new_row, evaluation_df, warning_flag)
+                if acceptable == True:
+                    evaluation_df = pd.concat([evaluation_df, new_row], ignore_index=True)
+                #evaluation_df = pd.concat([evaluation_df, new_row], ignore_index=True)
+                search_start = end+1
+            
+
+    GPT_IOB_tags.append(current_document_tags)
+
+evaluation_df.to_csv("IOB-evaluation.csv", index=False, header=False)
